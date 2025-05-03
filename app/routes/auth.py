@@ -165,21 +165,11 @@ def login():
 # --- Refresh Access Token ---
 # Accepts POST requests on /api/auth/refresh
 @bp.route("/refresh", methods=["POST"])
-@jwt_required(refresh=True) # Decorator requires a valid refresh token
+@jwt_required(refresh=True)
 def refresh():
-    """Generates a new non-fresh access token using a refresh token."""
-    # current_user is automatically loaded based on identity in refresh token
-    if not current_user or not current_user.is_active:
-         # Should ideally not happen if token verified, but good practice
-         return error_response("User not found or inactive", 401)
-
-    # Get existing claims from the refresh token to preserve them (like role)
-    claims = get_jwt()
-    additional_claims = {"role": claims.get('role', 'user')} # Default if somehow missing
-
-    # Create a new access token (non-fresh)
-    new_access_token = create_access_token(identity=current_user.id, additional_claims=additional_claims, fresh=False)
-
+    # ...
+    # Create a new non-fresh access token
+    new_access_token = create_access_token(identity=current_user.id, additional_claims=additional_claims, fresh=False) # <--- Explicitly non-fresh
     return jsonify(access_token=new_access_token)
 
 
@@ -245,7 +235,7 @@ def get_profile():
 # --- Change Password ---
 # Accepts POST requests on /api/auth/change-password
 @bp.route("/change-password", methods=["POST"])
-@jwt_required(fresh=True) # Require a fresh token (obtained recently from login)
+@jwt_required(fresh=True) # <--- Requires a fresh token
 def change_password():
     """Allows the authenticated user to change their password."""
     # current_user is loaded

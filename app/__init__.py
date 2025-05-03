@@ -156,9 +156,9 @@ def create_app(test_config=None):
     def missing_token_callback(error):
         return jsonify({"error": "Authorization token is missing"}), 401
 
-    @jwt.needs_fresh_token_loader
-    def token_not_fresh_callback(jwt_header, jwt_payload):
-        return jsonify({"error": "Fresh token required for this operation"}), 401
+@jwt.needs_fresh_token_loader
+def token_not_fresh_callback(jwt_header, jwt_payload):
+    return jsonify({"error": "Fresh token required for this operation"}), 401  # <--- Handles non-fresh token error
 
     @jwt.revoked_token_loader
     def revoked_token_callback(jwt_header, jwt_payload):
