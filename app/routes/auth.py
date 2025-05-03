@@ -1,3 +1,5 @@
+# --- START OF FILE app/routes/auth.py ---
+
 from flask import Blueprint, request, jsonify
 from flask_jwt_extended import (
     create_access_token,
@@ -5,96 +7,121 @@ from flask_jwt_extended import (
     jwt_required,
     get_jwt_identity,
     get_jwt,
-    verify_jwt_in_request # Import for manual verification if needed
+    current_user # Proxy object for the loaded user
 )
-from app import db, jwt, token_blocklist # Import blocklist
+from app import db, jwt, token_blocklist, bcrypt # Import blocklist and bcrypt
 from app.models.user import User
 from app.utils.validators import validate_email, error_response
-from app.utils.password_utils import validate_password_complexity # Assume complexity check is moved here
+from app.utils.password_utils import validate_password_complexity
 from app import admin_required # Import the admin decorator
+import uuid # For potentially generating unique usernames if needed
 
+# Blueprint configuration
+# Note: url_prefix='/api' is applied when registering the blueprint in app/__init__.py
+bp = Blueprint("auth", __name__, url_prefix="/auth") # Define prefix here for clarity within the module
 
-bp = Blueprint("auth", __name__, url_prefix="/api")
-
-# Register endpoint (accepts both paths)
+# --- Registration ---
+# Accepts POST requests on /api/auth/register (due to blueprint registration prefix)
+# Also added an alias route for /api/register if needed for compatibility
 @bp.route("/register", methods=["POST"])
-@bp.route("/auth/register", methods=["POST"])
+@bp.route("/register_alias", methods=["POST"]) # Alias route if /api/register is needed
 def register():
+    """Registers a new user."""
     data = request.get_json()
 
     if not data:
         return error_response("Request body must be JSON", 400)
 
     required_fields = ["email", "password"]
-    if not all(k in data for k in required_fields):
-        return error_response("Missing required fields: email, password", 400)
+    if not all(field in data for field in required_fields):
+        missing = [field for field in required_fields if field not in data]
+        return error_response(f"Missing required fields: {', '.join(missing)}", 400)
 
     email = data["email"].strip().lower()
-    password = data["password"] # Don't strip password
+    password = data["password"] # Don't strip password, complexity check handles spaces if needed
 
-    # Parse username or generate one
-    username = data.get("username")
-    first_name = data.get("first_name")
-    last_name = data.get("last_name")
+    # --- Username Handling ---
+    username_provided = data.get("username", "").strip().lower()
+    first_name = data.get("first_name", "").strip()
+    last_name = data.get("last_name", "").strip()
+    username = ""
 
-    if username:
-        username = username.strip().lower()
+    if username_provided:
+        username = username_provided
     elif first_name and last_name:
-        username = f"{first_name.strip().lower()}_{last_name.strip().lower()}"
-        # Check if generated username is valid/unique, handle potential collisions
-        if User.query.filter_by(username=username).first():
-             # Simple collision handling: append number or prompt user
-             return error_response(f"Generated username '{username}' already exists. Please provide a unique username.", 400)
+        # Generate username from first/last name (simple example)
+        base_username = f"{first_name.lower()}_{last_name.lower()}"
+        username = base_username
+        # Check for collisions and append number if needed (basic handling)
+        count = 1
+        while User.query.filter_by(username=username).first():
+            username = f"{base_username}{count}"
+            count += 1
+            if count > 10: # Limit attempts to avoid infinite loop
+                 return error_response("Could not generate a unique username from name.", 400)
     else:
-        # Default username from email prefix if no other info provided
-        username = email.split("@")[0]
-        if User.query.filter_by(username=username).first():
-             return error_response(f"Default username '{username}' already exists. Please provide a unique username.", 400)
+        # Default username from email prefix
+        username_prefix = email.split("@")[0]
+        username = username_prefix
+        count = 1
+        while User.query.filter_by(username=username).first():
+             username = f"{username_prefix}{count}"
+             count += 1
+             if count > 10:
+                 return error_response("Could not generate a unique username from email.", 400)
+
+    if not username:
+         return error_response("Could not determine username.", 400)
 
 
+    # --- Validation ---
     if not validate_email(email):
         return error_response("Invalid email format", 400)
 
-    # Use password complexity validator
     is_complex, message = validate_password_complexity(password)
     if not is_complex:
-        return error_response(message, 400)
+        return error_response(f"Password validation failed: {message}", 400)
 
-    # Check uniqueness
+    # Check uniqueness constraints
     if User.query.filter_by(username=username).first():
         return error_response("Username already exists", 409) # 409 Conflict
     if User.query.filter_by(email=email).first():
         return error_response("Email already exists", 409) # 409 Conflict
 
+    # --- User Creation ---
     try:
         new_user = User(
             username=username,
             email=email,
-            password=password,
-            first_name=first_name.strip() if first_name else None,
-            last_name=last_name.strip() if last_name else None
+            password=password, # Hashing happens in User.__init__
+            first_name=first_name or None,
+            last_name=last_name or None
+            # role and is_active default in User model
         )
         db.session.add(new_user)
         db.session.commit()
 
-        return jsonify(
-            {"message": "User registered successfully", "user": new_user.to_dict()}
-        ), 201
+        # Return user info (excluding password hash)
+        return jsonify({
+            "message": "User registered successfully",
+            "user": new_user.to_dict()
+        }), 201 # 201 Created
     except Exception as e:
         db.session.rollback()
-        # Log the exception e
-        print(f"Error during registration: {e}")
-        return error_response("Could not register user", 500)
+        print(f"Error during registration: {e}") # Log the error server-side
+        return error_response("Could not register user due to an internal error", 500)
 
 
-# Login endpoint (accepts both paths)
+# --- Login ---
+# Accepts POST requests on /api/auth/login
 @bp.route("/login", methods=["POST"])
-@bp.route("/auth/login", methods=["POST"])
 def login():
+    """Authenticates a user and returns JWT tokens."""
     data = request.get_json()
     if not data:
         return error_response("Request body must be JSON", 400)
 
+    # Allow login with either email or username
     identifier = data.get("email") or data.get("username")
     password = data.get("password")
 
@@ -108,111 +135,121 @@ def login():
         (User.email == identifier) | (User.username == identifier)
     ).first()
 
-    # Verify user and password
-    if not user or not user.check_password(password) or not user.is_active:
-        return error_response("Invalid credentials or inactive user", 401)
+    # Verify user exists, password is correct, and user is active
+    if not user or not user.check_password(password):
+        return error_response("Invalid credentials", 401) # Keep error generic for security
 
-    # Add role to JWT claims for authorization checks
-    # **SECURITY FIX: DO NOT ADD PLAINTEXT PASSWORD TO CLAIMS**
-    additional_claims = {'role': user.role}
-
-    # Create access and refresh tokens
-    access_token = create_access_token(identity=user.id, additional_claims=additional_claims, fresh=True) # Make login token fresh
-    refresh_token = create_refresh_token(identity=user.id, additional_claims=additional_claims)
-
-    response_data = {
-        "message": "Login successful",
-        "user": user.to_dict(),
-        # Return tokens using consistent keys expected by tests/frontend
-        "token": access_token,         # Common legacy key
-        "access_token": access_token,  # Standard key
-        "refresh_token": refresh_token
-    }
-
-    return jsonify(response_data)
-
-
-# Refresh access token
-@bp.route("/auth/refresh", methods=["POST"])
-@jwt_required(refresh=True) # CORRECT: Use refresh=True decorator
-def refresh():
-    current_user_id = get_jwt_identity() # This is the user ID (int)
-    user = User.query.get(current_user_id)
-
-    if not user or not user.is_active:
-         return error_response("User not found or inactive", 401) # Should not happen if token is valid, but check
-
-    # Get existing claims to persist role
-    claims = get_jwt()
-    additional_claims = {'role': claims.get('role', 'user')} # Default to 'user' if missing
-
-    # Create a new non-fresh access token
-    new_access_token = create_access_token(identity=current_user_id, additional_claims=additional_claims, fresh=False)
-
-    return jsonify(
-        {
-            "message": "Access token refreshed",
-            "token": new_access_token,        # Legacy key compatibility
-            "access_token": new_access_token # Standard key
-        }
-    )
-
-
-# Logout endpoint
-@bp.route("/auth/logout", methods=["POST"])
-@jwt_required() # Requires a valid access or refresh token to logout
-def logout():
-    jti = get_jwt()["jti"]
-    token_type = get_jwt()["type"] # Check if it's access or refresh
-
-    # Add the token's JTI to the blocklist
-    token_blocklist.add(jti)
-
-    # Optionally, block the refresh token if an access token is used for logout
-    # This requires storing refresh token JTIs or linking them, complex for simple blocklist
-
-    return jsonify({"message": f"Successfully logged out ({token_type} token revoked)"})
-
-# Verify token endpoint
-@bp.route("/auth/verify", methods=["POST"])
-@jwt_required() # CORRECT: Add decorator to enforce verification
-def verify_token():
-    # If @jwt_required passes, the token is valid and not expired/revoked
-    user_id = get_jwt_identity()
-    user = User.query.get(user_id)
-
-    if not user or not user.is_active:
-        # This case might indicate the user was deactivated after token issuance
-        return error_response("Token valid but user is inactive", 403)
-
-    return jsonify({"message": "Token is valid", "verified": True, "user_id": user_id, "role": get_jwt().get('role')})
-
-
-# Get user profile
-@bp.route("/auth/profile", methods=["GET"])
-@jwt_required() # Requires valid access token
-def get_profile():
-    current_user_id = get_jwt_identity()
-    user = User.query.get(current_user_id)
-
-    if not user:
-        # Should ideally not happen if token is valid, maybe user deleted?
-        return error_response("User not found", 404)
     if not user.is_active:
-        return error_response("User is inactive", 403)
+        return error_response("User account is inactive", 403) # Forbidden
+
+    # --- Token Creation ---
+    # Identity for the token is the user's ID
+    identity = user.id
+    # Add custom claims (e.g., role) to the access token
+    # **NEVER ADD SENSITIVE INFO LIKE PASSWORDS TO CLAIMS**
+    additional_claims = {"role": user.role}
+
+    # Create a fresh access token upon login
+    access_token = create_access_token(identity=identity, additional_claims=additional_claims, fresh=True)
+    # Create a refresh token (typically longer-lived)
+    refresh_token = create_refresh_token(identity=identity, additional_claims=additional_claims) # Include role here too if needed
+
+    return jsonify({
+        "message": "Login successful",
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "user": user.to_dict() # Include user info in response
+    })
 
 
-    return jsonify(user.to_dict())
+# --- Refresh Access Token ---
+# Accepts POST requests on /api/auth/refresh
+@bp.route("/refresh", methods=["POST"])
+@jwt_required(refresh=True) # Decorator requires a valid refresh token
+def refresh():
+    """Generates a new non-fresh access token using a refresh token."""
+    # current_user is automatically loaded based on identity in refresh token
+    if not current_user or not current_user.is_active:
+         # Should ideally not happen if token verified, but good practice
+         return error_response("User not found or inactive", 401)
+
+    # Get existing claims from the refresh token to preserve them (like role)
+    claims = get_jwt()
+    additional_claims = {"role": claims.get('role', 'user')} # Default if somehow missing
+
+    # Create a new access token (non-fresh)
+    new_access_token = create_access_token(identity=current_user.id, additional_claims=additional_claims, fresh=False)
+
+    return jsonify(access_token=new_access_token)
 
 
-# Change password endpoint
-@bp.route("/auth/change-password", methods=["POST"])
-@jwt_required(fresh=True) # Require a fresh token (from login)
+# --- Logout ---
+# Accepts POST requests on /api/auth/logout
+@bp.route("/logout", methods=["POST"])
+@jwt_required() # Requires a valid token (access or refresh) to logout
+def logout():
+    """Revokes the current token by adding its JTI to the blocklist."""
+    jti = get_jwt().get("jti")
+    token_type = get_jwt().get("type") # 'access' or 'refresh'
+
+    if not jti:
+         return error_response("Missing JTI in token, cannot revoke", 400)
+
+    token_blocklist.add(jti)
+    # print(f"Token JTI added to blocklist: {jti}") # Debugging
+
+    # For more robust logout, you might want to revoke associated refresh/access tokens
+    # This requires more complex state management (e.g., storing token pairs).
+
+    return jsonify({"message": f"Successfully logged out. {token_type.capitalize()} token revoked."})
+
+
+# --- Verify Token ---
+# Accepts POST requests on /api/auth/verify
+@bp.route("/verify", methods=["POST"])
+@jwt_required() # This decorator handles validation (signature, expiry, blocklist)
+def verify_token():
+    """Verifies the validity of the provided token."""
+    # If the decorator passes, the token is valid, not expired, and not revoked.
+    # current_user is loaded by the user_lookup_loader.
+    if not current_user: # Check if user lookup failed (e.g., user deleted after token issued)
+         return error_response("Token valid, but user not found", 404)
+    if not current_user.is_active:
+        return error_response("Token valid, but user account is inactive", 403)
+
+    # Return confirmation and potentially user info/role from token
+    claims = get_jwt()
+    return jsonify({
+        "message": "Token is valid and active",
+        "verified": True,
+        "user_id": current_user.id,
+        "role": claims.get('role', 'user') # Get role from claims
+    })
+
+
+# --- Get User Profile ---
+# Accepts GET requests on /api/auth/profile
+@bp.route("/profile", methods=["GET"])
+@jwt_required() # Requires a valid access token
+def get_profile():
+    """Returns the profile information of the currently authenticated user."""
+    # current_user is loaded via the user_lookup_loader associated with the JWT
+    if not current_user:
+        return error_response("User not found", 404) # Should not happen if token is valid
+    if not current_user.is_active:
+         return error_response("User account is inactive", 403)
+
+    return jsonify(current_user.to_dict())
+
+
+# --- Change Password ---
+# Accepts POST requests on /api/auth/change-password
+@bp.route("/change-password", methods=["POST"])
+@jwt_required(fresh=True) # Require a fresh token (obtained recently from login)
 def change_password():
-    current_user_id = get_jwt_identity()
-    user = User.query.get(current_user_id)
-
-    if not user or not user.is_active:
+    """Allows the authenticated user to change their password."""
+    # current_user is loaded
+    if not current_user or not current_user.is_active:
         return error_response("User not found or inactive", 404)
 
     data = request.get_json()
@@ -222,44 +259,61 @@ def change_password():
     current_password = data["current_password"]
     new_password = data["new_password"]
 
-    # Verify current password
-    if not user.check_password(current_password):
+    # Verify the current password
+    if not current_user.check_password(current_password):
         return error_response("Current password is incorrect", 401)
 
-    # Validate new password complexity
+    # Validate the new password complexity
     is_complex, message = validate_password_complexity(new_password)
     if not is_complex:
         return error_response(f"New password validation failed: {message}", 400)
 
     # Prevent setting the same password
-    if user.check_password(new_password):
+    if current_user.check_password(new_password):
         return error_response("New password cannot be the same as the current password", 400)
 
+    # --- Update Password ---
     try:
-        # Update password hash
-        user.set_password(new_password) # Use the model method
+        current_user.set_password(new_password) # Use the model method to hash and set
         db.session.commit()
-        # Optionally: Revoke all existing tokens for the user upon password change
-        # (Requires more complex token management than simple blocklist)
+
+        # SECURITY NOTE: Consider revoking all other existing tokens for this user
+        # upon password change. This requires more advanced token management.
+        # For now, just add the *current* token used for this request to the blocklist
+        # as a minimal measure, although the user might have other valid tokens.
+        jti = get_jwt().get("jti")
+        if jti:
+             token_blocklist.add(jti)
+
         return jsonify({"message": "Password changed successfully"})
     except Exception as e:
         db.session.rollback()
-        # Log exception e
-        print(f"Error changing password: {e}")
-        return error_response("Could not change password", 500)
+        print(f"Error changing password for user {current_user.id}: {e}")
+        return error_response("Could not change password due to an internal error", 500)
 
 
 # --- Admin Endpoints ---
 
-@bp.route("/auth/users", methods=["GET"])
+# Accepts GET requests on /api/auth/users
+@bp.route("/users", methods=["GET"])
 @jwt_required()
-@admin_required() # Use the admin decorator
+@admin_required() # Apply the custom admin decorator
 def get_all_users():
-    """Retrieve a list of all users (Admin-only)"""
+    """(Admin Only) Retrieve a paginated list of all users."""
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', 10, type=int)
+    # Validate pagination params
+    if page < 1 or per_page < 1 or per_page > 100:
+         return error_response("Invalid pagination parameters. Page must be >= 1, 1 <= per_page <= 100", 400)
 
-    users_pagination = User.query.paginate(page=page, per_page=per_page, error_out=False)
+    try:
+        users_pagination = User.query.order_by(User.id.asc()).paginate(
+            page=page, per_page=per_page, error_out=False # error_out=False prevents 404 on empty page
+        )
+    except Exception as e:
+        print(f"Error during user pagination: {e}")
+        return error_response("Error retrieving users", 500)
+
     users_list = [user.to_dict() for user in users_pagination.items]
 
     return jsonify({
@@ -270,29 +324,37 @@ def get_all_users():
         "total_pages": users_pagination.pages
     })
 
-@bp.route("/auth/user/<int:user_id>", methods=["DELETE"])
+# Accepts DELETE requests on /api/auth/user/<user_id>
+@bp.route("/user/<int:user_id>", methods=["DELETE"])
 @jwt_required()
-@admin_required() # Use the admin decorator
+@admin_required() # Apply the custom admin decorator
 def delete_user(user_id):
-    """Delete a user by ID (Admin-only)"""
-    current_user_id = get_jwt_identity()
-    if user_id == current_user_id:
-        return error_response("Admin cannot delete their own account via this endpoint", 403)
+    """(Admin Only) Delete a user by ID (Hard Delete)."""
+    # Prevent admin from deleting themselves via this endpoint
+    if user_id == get_jwt_identity():
+        return error_response("Admin cannot delete their own account using this endpoint", 403)
 
-    user = User.query.get(user_id)
-    if not user:
+    user_to_delete = User.query.get(user_id)
+    if not user_to_delete:
         return error_response("User not found", 404)
 
+    # Check if deleting an admin (optional: prevent deleting other admins?)
+    # if user_to_delete.role == 'admin':
+    #     return error_response("Cannot delete another admin account", 403)
+
     try:
-        # Hard delete: Deletes the user and potentially associated data via cascades (check model definitions)
-        # Soft delete alternative: user.is_active = False
-        db.session.delete(user)
+        # Hard delete: Deletes the user record and cascades based on model relationships (e.g., deletes accounts)
+        # Soft delete alternative: user_to_delete.is_active = False
+        db.session.delete(user_to_delete)
         db.session.commit()
-        # Optionally: Revoke any remaining tokens for the deleted user (complex with simple blocklist)
-        return jsonify({"message": f"User ID {user_id} deleted successfully"})
+
+        # SECURITY NOTE: Ideally, revoke any remaining tokens for the deleted user.
+        # This is complex with a simple blocklist.
+
+        return jsonify({"message": f"User ID {user_id} ({user_to_delete.username}) deleted successfully"})
     except Exception as e:
         db.session.rollback()
-        # Log exception e
         print(f"Error deleting user {user_id}: {e}")
-        # Check for constraints violation (e.g., if cascade isn't set up correctly)
-        return error_response(f"Could not delete user {user_id}", 500)
+        # Check for specific errors like constraint violations if cascade isn't working as expected
+        return error_response(f"Could not delete user {user_id} due to an internal error", 500)
+# --- END OF FILE app/routes/auth.py ---

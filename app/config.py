@@ -1,67 +1,110 @@
+# --- START OF FILE app/config.py ---
+
 import os
 from datetime import timedelta
 
+# Base directory of the application
+basedir = os.path.abspath(os.path.dirname(__file__))
+# Instance folder path (usually one level up from 'app' directory)
+instance_path = os.path.join(basedir, '..', 'instance')
+
 class Config:
-    """Base configuration class for the application."""
-    SECRET_KEY = os.environ.get('SECRET_KEY', 'a-very-secure-default-secret-key') # Use a better default
-    SQLALCHEMY_DATABASE_URI = os.environ.get('SQLALCHEMY_DATABASE_URI', 'sqlite:///bank.db') # Default to file in instance folder
-    SQLALCHEMY_TRACK_MODIFICATIONS = False
-    JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY', 'a-secure-jwt-secret-key') # Use a better default
-    JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=1)
-    JWT_REFRESH_TOKEN_EXPIRES = timedelta(days=30)
-    # Configure JWT to include 'jti' needed for blocklisting
-    JWT_DECODE_ISSUER = False # Adjust if you use issuer validation
-    JWT_ENCODE_ISSUER = None
-    JWT_ALGORITHM = "HS256"
+    """Base configuration class."""
+    # Secret key for session management, CSRF, etc.
+    # IMPORTANT: Load from environment variable in production!
+    SECRET_KEY = os.environ.get('SECRET_KEY', 'a-very-insecure-default-secret-key-CHANGE-ME')
+
+    # Database configuration
+    # Default to SQLite in the instance folder for easy setup
+    SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') or \
+        f'sqlite:///{os.path.join(instance_path, "bank.db")}'
+    SQLALCHEMY_TRACK_MODIFICATIONS = False # Disable modification tracking to save resources
+
+    # JWT Configuration
+    # IMPORTANT: Load from environment variable in production!
+    JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY', 'a-very-insecure-jwt-secret-key-CHANGE-ME')
+    JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=1) # Default access token lifetime
+    JWT_REFRESH_TOKEN_EXPIRES = timedelta(days=30) # Default refresh token lifetime
+    # Include 'jti' (JWT ID) in tokens, required for blocklisting/revocation
+    JWT_ACCESS_JTI = True
+    JWT_REFRESH_JTI = True
+    # Where to look for the JWT (standard 'Authorization: Bearer <token>' header)
+    JWT_TOKEN_LOCATION = ["headers"]
+
     # Application specific configs
     DEBUG = False
     TESTING = False
-    ENABLE_RATE_LIMIT = True # Flag to easily disable rate limiting if needed
+    ENABLE_RATE_LIMIT = True # Enable rate limiting by default
+
+    # Ensure instance folder exists for SQLite database if used
+    if SQLALCHEMY_DATABASE_URI.startswith('sqlite:///'):
+        db_path = SQLALCHEMY_DATABASE_URI.split('sqlite:///')[-1]
+        if not os.path.isabs(db_path): # If it's relative, assume it's in instance path
+             db_dir = os.path.dirname(os.path.join(instance_path, db_path))
+             os.makedirs(db_dir, exist_ok=True)
+        else: # If absolute path, ensure directory exists
+             db_dir = os.path.dirname(db_path)
+             os.makedirs(db_dir, exist_ok=True)
+
 
 class DevelopmentConfig(Config):
-    """Development configuration."""
+    """Development specific configuration."""
     DEBUG = True
-    # Use a file-based db for easier inspection in dev
-    SQLALCHEMY_DATABASE_URI = os.environ.get('DEV_DATABASE_URI', 'sqlite:///../instance/bank_dev.db') # Path relative to app folder
-    SECRET_KEY = 'dev-secret-key' # Keep simple key for dev
-    JWT_SECRET_KEY = 'dev-jwt-secret-key' # Keep simple key for dev
+    # Use a separate database file for development
+    SQLALCHEMY_DATABASE_URI = os.environ.get('DEV_DATABASE_URL') or \
+        f'sqlite:///{os.path.join(instance_path, "bank_dev.db")}'
+    # Use simpler keys for development, but still recommend setting via .env
+    SECRET_KEY = os.environ.get('SECRET_KEY', 'dev-secret-key')
+    JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY', 'dev-jwt-secret-key')
+    # Optionally disable rate limiting for easier development
+    # ENABLE_RATE_LIMIT = False
 
 
 class TestingConfig(Config):
-    """Testing configuration."""
+    """Testing specific configuration."""
     TESTING = True
-    SQLALCHEMY_DATABASE_URI = 'sqlite:///:memory:' # Use in-memory DB for tests
+    DEBUG = True # Often helpful during tests
+    SQLALCHEMY_DATABASE_URI = 'sqlite:///:memory:' # Use in-memory SQLite database for tests
     SECRET_KEY = 'test-secret-key'
     JWT_SECRET_KEY = 'test-jwt-secret-key'
-    JWT_ACCESS_TOKEN_EXPIRES = timedelta(seconds=5) # Short expiry for testing token expiration
+    # Use very short token expiry times for testing expiration scenarios
+    JWT_ACCESS_TOKEN_EXPIRES = timedelta(seconds=5)
     JWT_REFRESH_TOKEN_EXPIRES = timedelta(seconds=10)
-    # Disable CSRF protection if using Flask-WTF (not used here)
+    # Disable CSRF protection if Flask-WTF is used (not used here, but common practice)
     WTF_CSRF_ENABLED = False
-    DEBUG = True # Often helpful to have debug on during tests
-    ENABLE_RATE_LIMIT = False # Disable rate limiting for tests
+    # Disable rate limiting during tests
+    ENABLE_RATE_LIMIT = False
 
 
 class ProductionConfig(Config):
-    """Production configuration."""
-    # Ensure these are set via environment variables in production
+    """Production specific configuration."""
+    # DEBUG and TESTING must be False in production
+    DEBUG = False
+    TESTING = False
+
+    # Enforce loading sensitive keys from environment variables
     SECRET_KEY = os.environ.get('SECRET_KEY')
     JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY')
-    SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL') # Use DATABASE_URL convention
-    ENABLE_RATE_LIMIT = True # Ensure rate limiting is on
+    # Use DATABASE_URL convention for production database (e.g., PostgreSQL, MySQL)
+    SQLALCHEMY_DATABASE_URI = os.environ.get('DATABASE_URL')
+    ENABLE_RATE_LIMIT = True # Ensure rate limiting is enabled
 
-    # Basic input validation for production config
+    # --- Input Validation for Production ---
     if not SECRET_KEY:
-        raise ValueError("No SECRET_KEY set for Flask application in production")
+        raise ValueError("No SECRET_KEY set. Set the SECRET_KEY environment variable for production.")
     if not JWT_SECRET_KEY:
-        raise ValueError("No JWT_SECRET_KEY set for Flask application in production")
+        raise ValueError("No JWT_SECRET_KEY set. Set the JWT_SECRET_KEY environment variable for production.")
     if not SQLALCHEMY_DATABASE_URI:
-        raise ValueError("No DATABASE_URL set for Flask application in production")
+        raise ValueError("No DATABASE_URL set. Set the DATABASE_URL environment variable for production.")
+    if SQLALCHEMY_DATABASE_URI.startswith('sqlite'):
+         print("WARNING: Using SQLite database in production is generally not recommended.")
 
 
-# Configuration dictionary to select the appropriate configuration
+# Dictionary to easily select the configuration
 config = {
     'development': DevelopmentConfig,
     'testing': TestingConfig,
     'production': ProductionConfig,
-    'default': DevelopmentConfig
+    'default': DevelopmentConfig # Default to development if FLASK_CONFIG is not set
 }
+# --- END OF FILE app/config.py ---
